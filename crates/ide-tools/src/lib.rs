@@ -984,30 +984,24 @@ impl Tools {
         let result = (|| {
             std::fs::create_dir_all(&self.root)?;
             let method = self.install_method(spec);
-            emit(InstallEvent::Line {
-                text: format!("Installing {} via {}…", spec.display, self.method_label(method)),
-            });
-            match method {
-                Method::Bundled { .. } => {
-                    bundled::install(&self.root, spec)?;
-                }
-                Method::Rustup { component } => {
-                    let mut c = self.command(self.which("rustup").expect("checked"));
-                    c.args(["component", "add", component]);
-                    run_streamed(c, cancel, emit)?;
-                }
-                Method::Npm { packages } => self.install_npm(packages, cancel, emit)?,
-                Method::Go { module } => self.install_go(spec, module, cancel, emit)?,
-                Method::Gem { gem } => self.install_gem(spec, gem, cancel, emit)?,
-                Method::GemActive { gem } => self.install_gem_active(gem, cancel, emit)?,
-                Method::DotnetTool { package } => self.install_dotnet_tool(spec, package, cancel, emit)?,
-                Method::PipVenv { package } => self.install_venv(spec, package, cancel, emit)?,
-                Method::PipUser { package, .. } => self.install_pip_user(package, cancel, emit)?,
-                Method::PipTarget { package, .. } => self.install_pip_target(spec, package, cancel, emit)?,
-                Method::Release { source, assets, locate } => {
-                    self.install_release(spec, source, assets, locate, cancel, emit)?
-                }
+            let mut attempt = self.run_install_method(spec, method, cancel, emit);
+            // A rustup mirror can 404 the component even though rustup itself
+            // exists; retry via the release asset instead of failing outright.
+            if attempt.is_err()
+                && spec.fallback.is_some()
+                && std::mem::discriminant(&method) == std::mem::discriminant(&spec.method)
+            {
+                let fallback = spec.fallback.unwrap();
+                emit(InstallEvent::Line {
+                    text: format!(
+                        "{} failed; retrying via {}…",
+                        self.method_label(method),
+                        self.method_label(fallback)
+                    ),
+                });
+                attempt = self.run_install_method(spec, fallback, cancel, emit);
             }
+            attempt?;
             let info = self.info(name, langs)?;
             if info.status == ToolStatus::Missing {
                 return Err(IdeError::new(
@@ -1024,6 +1018,40 @@ impl Tools {
         release_install_slot(name, &slot);
         slot.finish(result.clone());
         result
+    }
+
+    fn run_install_method(
+        &self,
+        spec: &ToolSpec,
+        method: Method,
+        cancel: &CancellationToken,
+        emit: Emit,
+    ) -> IdeResult<()> {
+        emit(InstallEvent::Line {
+            text: format!("Installing {} via {}…", spec.display, self.method_label(method)),
+        });
+        match method {
+            Method::Bundled { .. } => {
+                bundled::install(&self.root, spec)?;
+            }
+            Method::Rustup { component } => {
+                let mut c = self.command(self.which("rustup").expect("checked"));
+                c.args(["component", "add", component]);
+                run_streamed(c, cancel, emit)?;
+            }
+            Method::Npm { packages } => self.install_npm(packages, cancel, emit)?,
+            Method::Go { module } => self.install_go(spec, module, cancel, emit)?,
+            Method::Gem { gem } => self.install_gem(spec, gem, cancel, emit)?,
+            Method::GemActive { gem } => self.install_gem_active(gem, cancel, emit)?,
+            Method::DotnetTool { package } => self.install_dotnet_tool(spec, package, cancel, emit)?,
+            Method::PipVenv { package } => self.install_venv(spec, package, cancel, emit)?,
+            Method::PipUser { package, .. } => self.install_pip_user(package, cancel, emit)?,
+            Method::PipTarget { package, .. } => self.install_pip_target(spec, package, cancel, emit)?,
+            Method::Release { source, assets, locate } => {
+                self.install_release(spec, source, assets, locate, cancel, emit)?
+            }
+        }
+        Ok(())
     }
 
     fn npm_manager(&self) -> IdeResult<(PathBuf, bool)> {
