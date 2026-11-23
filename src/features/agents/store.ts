@@ -27,6 +27,7 @@ import { auxiliaryWindow, windowLabel } from "@/platform/auxWindow";
 import { routeToWindow, taskWindowDraft, taskWindowFocused, updateTaskWindowDraft } from "./taskWindowRouting";
 import { clearAgentTaskFontZoom, resetAllAgentFontZoom } from "./fontZoom";
 import { clearDismissedAssets } from "./sessionAssetsModel";
+import { useSkillsCatalog } from "./skillsModel";
 import { basename, useProject } from "@/platform/project";
 import { defaultTaskProject } from "./project";
 import { call, commands, isTauri, nextRequestId } from "@/platform/ipc";
@@ -39,6 +40,7 @@ import {
   shellCommand,
   cursorModelDefaults,
   emptyDraft,
+  hasMention,
   isMentioned,
   isPerModelOption,
   mentionOf,
@@ -530,6 +532,7 @@ async function refreshProviderModels(
 export async function connect(): Promise<void> {
   if (!isTauri()) return;
   const gen = ++generation;
+  clearChangeRefreshes();
   const channel = new Channel<AgentEvent>();
   channel.onmessage = (e) => {
     if (gen === generation) onEvent(e);
@@ -615,8 +618,6 @@ const CACHED_CLOSED_TASKS = 5;
 
 /** Recent closed-task ids kept in memory so reopening a just-closed tab avoids refetching. */
 const closedTaskMru: string[] = [];
-/** Bumped when a task's cache is dropped, so a fetch started before that doesn't refill it. */
-const cacheDrops = new Map<string, number>();
 
 function isTaskKey(key: string, taskId: string): boolean {
   return key === taskId || key.startsWith(`${taskId}/`);
@@ -638,11 +639,9 @@ function clearTaskMaps(taskId: string, clearStreaming = false) {
     if (isTaskKey(key, taskId)) positions.delete(key);
   }
   if (clearStreaming) streamingReply.delete(taskId);
-  const timer = pendingChanges.get(taskId);
-  if (timer !== undefined) {
-    clearTimeout(timer);
-    pendingChanges.delete(taskId);
-  }
+  cancelScheduledChanges(taskId);
+  const last = changeRefreshes.get(taskId);
+  if (last) last.cache.dropped = true;
 }
 
 function withoutTaskCache(s: AgentsState, taskId: string): Partial<AgentsState> | null {
@@ -681,8 +680,6 @@ function withoutTaskCache(s: AgentsState, taskId: string): Partial<AgentsState> 
 
 function dropTaskCache(taskId: string) {
   clearTaskMaps(taskId);
-  // A deleted task needs no marker: fetches already discard results for tasks that are gone.
-  if (useAgents.getState().tasks.has(taskId)) cacheDrops.set(taskId, (cacheDrops.get(taskId) ?? 0) + 1);
   useAgents.setState((s) => withoutTaskCache(s, taskId) ?? s);
 }
 
@@ -725,9 +722,7 @@ export function disconnect() {
   streamingReply.clear();
   modelFlights.clear();
   closedTaskMru.length = 0;
-  cacheDrops.clear();
-  for (const timer of pendingChanges.values()) clearTimeout(timer);
-  pendingChanges.clear();
+  clearChangeRefreshes();
   resetAllAgentFontZoom();
   useAgents.setState({
     loaded: false,
@@ -779,7 +774,6 @@ function onEvent(e: AgentEvent) {
     }
     case "removed": {
       clearTaskMaps(e.id, true);
-      cacheDrops.delete(e.id);
       const tasks = new Map(s.tasks);
       tasks.delete(e.id);
       const composers = new Map(s.composers);
@@ -920,17 +914,49 @@ export async function loadEntries(task: string, subagent: string | null = null):
   }
 }
 
-export async function refreshChanges(task: string): Promise<void> {
-  // Discard a result that arrives after a project switch, the task's deletion, or its cache being dropped.
+const pendingChanges = new Map<string, ReturnType<typeof setTimeout>>();
+/** Last pass for each task. The active and trailing pass share a cache lifetime until eviction. */
+const changeRefreshes = new Map<string, { done: Promise<void>; started: boolean; cache: { dropped: boolean } }>();
+
+function cancelScheduledChanges(task: string) {
+  clearTimeout(pendingChanges.get(task));
+  pendingChanges.delete(task);
+}
+
+function clearChangeRefreshes() {
+  for (const timer of pendingChanges.values()) clearTimeout(timer);
+  pendingChanges.clear();
+  changeRefreshes.clear();
+}
+
+/** Waits for the first read that starts after this request, not for the queue to go idle. */
+export function refreshChanges(task: string): Promise<void> {
+  if (!useAgents.getState().tasks.has(task)) return Promise.resolve();
+  const last = changeRefreshes.get(task);
+  const current = last && !last.cache.dropped ? last : undefined;
+  if (current && !current.started) return current.done;
+
   const gen = generation;
-  const drops = cacheDrops.get(task);
-  const stillWanted = () =>
-    gen === generation && useAgents.getState().tasks.has(task) && cacheDrops.get(task) === drops;
-  // The whole task's changes are read in either scope: the session's summary counts them.
-  await Promise.all([
-    refreshTaskChanges(task, stillWanted),
-    useChangesOptions.getState().scope === "turn" && refreshTurnChanges(task, stillWanted),
-  ]);
+  const pass = { done: Promise.resolve(), started: false, cache: current?.cache ?? { dropped: false } };
+  const stillWanted = () => gen === generation && !pass.cache.dropped && useAgents.getState().tasks.has(task);
+  const read = async () => {
+    pass.started = true;
+    try {
+      if (!stillWanted()) return;
+      cancelScheduledChanges(task); // This read covers notifications still waiting on the timer.
+      // The session summary needs the whole task even when the pane shows just its last turn.
+      await Promise.all([
+        refreshTaskChanges(task, stillWanted),
+        useChangesOptions.getState().scope === "turn" && refreshTurnChanges(task, stillWanted),
+      ]);
+    } finally {
+      if (changeRefreshes.get(task) === pass) changeRefreshes.delete(task);
+    }
+  };
+  changeRefreshes.set(task, pass);
+  // A reopened tab can't cancel the obsolete IPC either; wait for it before starting a fresh read.
+  pass.done = last ? last.done.then(read, read) : read();
+  return pass.done;
 }
 
 async function refreshTurnChanges(task: string, stillWanted: () => boolean): Promise<void> {
@@ -994,7 +1020,6 @@ export async function acceptChanges(task: string, relPaths: string[] | null): Pr
   }
 }
 
-const pendingChanges = new Map<string, ReturnType<typeof setTimeout>>();
 /** Reloads the task's changes after a short pause (tool diffs, commits landing). */
 export function scheduleChanges(task: string) {
   if (pendingChanges.has(task)) return;
@@ -1040,6 +1065,8 @@ export function useAgentCommands(
   task: string | null,
   offered: readonly AgentCommand[],
 ): readonly AgentCommand[] {
+  const skillOverrides = useAgents((s) => (task ? s.tasks.get(task)?.skillOverrides : s.draft.skillOverrides));
+  const catalogSkills = useSkillsCatalog((s) => s.skills);
   const [found, setFound] = useState<{
     for: unknown[];
     list: readonly AgentCommand[];
@@ -1048,15 +1075,44 @@ export function useAgentCommands(
     if (!provider || !isTauri()) return;
     let alive = true;
     call(commands.agentCommands(provider, task))
-      .then((list) => alive && setFound({ for: [provider, task, offered], list }))
+      .then((list) => alive && setFound({ for: [provider, task, offered, skillOverrides, catalogSkills], list }))
       .catch(() => {});
     return () => {
       alive = false;
     };
-  }, [provider, task, offered]);
+  }, [provider, task, offered, skillOverrides, catalogSkills]);
   // Until the list for these arguments arrives, what the agent offered.
-  const current = found && found.for[0] === provider && found.for[1] === task && found.for[2] === offered;
-  return current ? found.list : offered;
+  const current =
+    found &&
+    found.for[0] === provider &&
+    found.for[1] === task &&
+    found.for[2] === offered &&
+    found.for[3] === skillOverrides &&
+    found.for[4] === catalogSkills;
+  const base = current ? found.list : offered;
+  if (task !== null || !skillOverrides || Object.keys(skillOverrides).length === 0) return base;
+  const off = new Set(
+    Object.entries(skillOverrides)
+      .filter(([, mode]) => mode === "off")
+      .map(([name]) => name.toLowerCase()),
+  );
+  const filtered = base.filter((c) => !off.has(c.name.replace(/^\$/, "").toLowerCase()));
+  const extra: AgentCommand[] = [];
+  for (const [name, mode] of Object.entries(skillOverrides)) {
+    if (mode === "off") continue;
+    const lower = name.toLowerCase();
+    if (filtered.some((c) => c.name.replace(/^\$/, "").toLowerCase() === lower)) continue;
+    const match = catalogSkills.find((s) => s.skill.name.toLowerCase() === lower && s.origin !== "trust");
+    if (match && match.skill.userInvocable !== false) {
+      extra.push({
+        name: match.skill.name,
+        description: match.skill.description,
+        hint: match.skill.hint ?? null,
+        source: "skill",
+      });
+    }
+  }
+  return extra.length > 0 ? [...filtered, ...extra] : filtered;
 }
 
 export function openTask(task: string) {
@@ -1642,16 +1698,20 @@ export interface ReferenceTarget {
  * how many were added; a path outside every project shows a notice.
  */
 export function addReferences(targets: readonly ReferenceTarget[]): number {
-  return appendToComposer((mentions) => mentions.join(" "), targets);
+  // A reference the message already holds (same file, same lines) is not added a second time.
+  return appendToComposer(
+    (mentions, text) => mentions.filter((m, i) => !hasMention(text, m) && mentions.indexOf(m) === i).join(" "),
+    targets,
+  );
 }
 
 /**
  * Appends text to the agent message typed last (a task's or New Task's) and opens it; nothing is
  * sent. `compose` gets the `@` mentions of `targets` (those inside this window's projects, which
- * also become chips). Returns how many targets were referenced.
+ * also become chips) and the message's current text. Returns how many targets were referenced.
  */
 export function appendToComposer(
-  compose: (mentions: readonly string[]) => string,
+  compose: (mentions: readonly string[], text: string) => string,
   targets: readonly ReferenceTarget[] = [],
 ): number {
   const s = useAgents.getState();
@@ -1677,15 +1737,26 @@ export function appendToComposer(
   }
   if (files.length < targets.length)
     notifications().notify({ level: "info", title: tx("Only files of this window's projects can be referenced") });
-  const joined = compose(mentions);
-  if (!joined) return 0;
+  const joined = compose(mentions, current.text);
+  if (!joined) {
+    // Every reference is already in the message: show it rather than doing nothing.
+    if (!files.length) return 0;
+    if (task) openTask(task.id);
+    else openHome();
+    return files.length;
+  }
   // A block of several lines (a test failure) goes in a paragraph of its own.
   const text = joined.includes("\n")
     ? `${current.text.trimEnd() ? `${current.text.trimEnd()}\n\n` : ""}${joined}\n`
     : current.text && !/\s$/.test(current.text)
       ? `${current.text} ${joined} `
       : `${current.text}${joined} `;
-  updateComposer(key, { text, files: [...current.files, ...files] });
+  const added = files.filter(
+    (f, i) =>
+      !current.files.some((c) => c.path === f.path && c.rel === f.rel) &&
+      files.findIndex((o) => o.path === f.path && o.rel === f.rel) === i,
+  );
+  updateComposer(key, { text, files: [...current.files, ...added] });
   if (task) openTask(task.id);
   else openHome();
   return files.length;

@@ -1,11 +1,13 @@
 /**
- * Text editor wrapper of Markdown files: the editor, a live preview, or both
- * side by side, switched from the tab strip or a floating toolbar. The
+ * Text editor wrapper of Markdown files: the editor, a live preview, or both,
+ * switched from the tab strip or a floating toolbar. The
  * preview follows the editor's scroll position in the split layout; Preview
  * only, it follows navigation in the hidden editor and reports the line on
  * screen (Structure's Autoscroll from Source).
  */
 import {
+  Suspense,
+  use,
   useDeferredValue,
   useEffect,
   useLayoutEffect,
@@ -20,11 +22,11 @@ import {
 import clsx from "clsx";
 import { call, commands, isTauri } from "@/platform/ipc";
 import { editorPrefs, useEditorPrefs } from "@/platform/editorSettings";
-import { useMarkdownPreviewFontSize } from "@/platform/languageSettings";
+import { useMarkdownPreviewFontSize, useMarkdownPreviewLayout } from "@/platform/languageSettings";
 import { maybeEditorService, registerFontZoomSurface } from "@/workbench/contributions";
 import { editorsFor, setShownLine } from "@/editor/api";
 import { highlightInto } from "@/editor/lsp/markdown";
-import { FloatingToolbar, SplitGroup, SplitHandle, SplitPanel, selectableText } from "@/ui";
+import { FloatingToolbar, Spinner, SplitGroup, SplitHandle, SplitPanel, selectableText } from "@/ui";
 import {
   FIND_CURRENT_HIGHLIGHT,
   FIND_HIGHLIGHT,
@@ -42,6 +44,7 @@ import { publishPreviewSelection, publishPreviewTop, stepMarkdownPreviewFontZoom
 import { subscribeTheme, themeKey } from "@/platform/themeWatch";
 import { hasMermaid, MERMAID_SELECTOR, renderMermaidIn } from "./mermaid";
 import { renderMath } from "@/editor/lsp/markdownMath";
+import type { renderMathSvg } from "./mathSvg";
 import { modeOf, pinMarkdownMode, useMarkdownModes } from "./modes";
 import { MarkdownLayoutActions } from "./MarkdownLayoutActions";
 import {
@@ -91,6 +94,7 @@ function attachImagePanZoom(img: HTMLImageElement): void {
 }
 
 const SPLIT_STORAGE_KEY = "openidea.markdown.split";
+const DEFAULT_SPLIT_LAYOUT = { editor: 50, preview: 50 };
 
 export function MarkdownEditor({
   path,
@@ -104,6 +108,7 @@ export function MarkdownEditor({
   actionsInTabs?: boolean;
 }) {
   const mode = useMarkdownModes((s) => modeOf(s, tabId));
+  const stacked = useMarkdownPreviewLayout() === "stacked";
   useEffect(() => pinMarkdownMode(tabId), [tabId]);
   const ref = useRef<HTMLDivElement>(null);
   const editorRef = useRef<HTMLDivElement>(null);
@@ -128,13 +133,15 @@ export function MarkdownEditor({
   }, [path, tabId]);
 
   const splitBounds = mode === "split" ? { minSize: "10%", maxSize: "90%" } : {};
+  const storageKey = stacked ? `${SPLIT_STORAGE_KEY}.stacked` : SPLIT_STORAGE_KEY;
   return (
     <div ref={ref} className={clsx(styles.split, styles[`mode-${mode}`])}>
       <SplitGroup
-        orientation="horizontal"
+        orientation={stacked ? "vertical" : "horizontal"}
         disableCursor
         className={styles.group}
-        storageKey={mode === "split" ? SPLIT_STORAGE_KEY : undefined}
+        storageKey={mode === "split" ? storageKey : undefined}
+        defaultLayout={mode === "split" ? DEFAULT_SPLIT_LAYOUT : undefined}
       >
         {/* Hidden but mounted in Preview only (its caret drives the preview). Disabled, it leaves the group a
             single resizable panel: two enabled panels without a separator get an implicit resize region between
@@ -147,7 +154,15 @@ export function MarkdownEditor({
         {mode === "split" && <SplitHandle aria-label={tx("Resize Markdown preview")} />}
         {mode !== "editor" && (
           <SplitPanel id="preview" style={{ overflow: "hidden" }} {...splitBounds}>
-            <MarkdownPreview path={path} sync={mode === "split"} />
+            <Suspense
+              fallback={
+                <div className={styles.preview}>
+                  <Spinner label={tx("Loading")} />
+                </div>
+              }
+            >
+              <MarkdownPreview path={path} sync={mode === "split"} />
+            </Suspense>
           </SplitPanel>
         )}
       </SplitGroup>
@@ -163,8 +178,19 @@ export function MarkdownEditor({
 const blocksOf = (root: HTMLElement) =>
   [...root.querySelectorAll<HTMLElement>(":scope > [data-line]")].map((el) => ({
     line: Number(el.dataset.line),
-    top: el.offsetTop,
+    get top() {
+      return el.offsetTop;
+    },
   }));
+
+let svgRenderer: Promise<typeof renderMathSvg | null> | undefined;
+
+function loadSvgRenderer() {
+  return (svgRenderer ??= import("./mathSvg").then(
+    (module) => module.renderMathSvg,
+    () => null,
+  ));
+}
 
 function MarkdownPreview({ path, sync }: { path: string; sync: boolean }) {
   const text = useLiveMarkdown((s) => s[path]?.text);
@@ -181,7 +207,9 @@ function MarkdownPreview({ path, sync }: { path: string; sync: boolean }) {
   const deferred = useDeferredValue(text ?? "");
   const [render] = useState(createMarkdownRenderer);
   const html = useMemo(() => render(deferred), [render, deferred]);
+  const renderSvg = html.includes(' data-math="') ? use(loadSvgRenderer()) : null;
   const ref = useRef<HTMLDivElement>(null);
+  const blocks = useRef<ReturnType<typeof blocksOf>>([]);
   const theme = useSyncExternalStore(subscribeTheme, themeKey, () => "");
   const diagrams = useRef<Node[]>([]);
   const [diagramsDrawn, setDiagramsDrawn] = useState(0);
@@ -206,9 +234,11 @@ function MarkdownPreview({ path, sync }: { path: string; sync: boolean }) {
   // Math before the preview index: typesetting changes the blocks' heights.
   useLayoutEffect(() => {
     if (!ref.current) return;
+    renderSvg?.(ref.current);
     renderMath(ref.current);
+    blocks.current = blocksOf(ref.current);
     invalidatePreviewIndex(ref.current);
-  }, [html]);
+  }, [html, renderSvg]);
 
   // Mermaid diagrams: before paint, so cached ones don't flash their source.
   useLayoutEffect(() => {
@@ -287,7 +317,7 @@ function MarkdownPreview({ path, sync }: { path: string; sync: boolean }) {
   useLayoutEffect(() => {
     const root = ref.current;
     if (!root || !sync) return;
-    root.scrollTop = topLine <= 0 ? 0 : previewOffsetForLine(blocksOf(root), topLine, root.scrollHeight);
+    root.scrollTop = topLine <= 0 ? 0 : previewOffsetForLine(blocks.current, topLine, root.scrollHeight);
   }, [html, topLine, scrollSeq, sync, diagramsDrawn, fontZoom, fontSize]);
 
   // Keep the split preview anchored to `topLine` as dragging the divider or resizing the window reflows text.
@@ -299,7 +329,7 @@ function MarkdownPreview({ path, sync }: { path: string; sync: boolean }) {
       if (root.clientWidth === width) return;
       width = root.clientWidth;
       const top = useLiveMarkdown.getState()[path]?.topLine ?? 0;
-      root.scrollTop = top <= 0 ? 0 : previewOffsetForLine(blocksOf(root), top, root.scrollHeight);
+      root.scrollTop = top <= 0 ? 0 : previewOffsetForLine(blocks.current, top, root.scrollHeight);
     });
     ro.observe(root);
     return () => ro.disconnect();
@@ -366,10 +396,9 @@ function MarkdownPreview({ path, sync }: { path: string; sync: boolean }) {
         }
       }
     }
-    const blocks = blocksOf(root);
     // Back / Forward return to the line on screen: keep the restored offset within it.
-    if (previewLineAtOffset(blocks, root.scrollTop) !== caretLine) {
-      root.scrollTop = previewOffsetForLine(blocks, caretLine, root.scrollHeight);
+    if (previewLineAtOffset(blocks.current, root.scrollTop) !== caretLine) {
+      root.scrollTop = previewOffsetForLine(blocks.current, caretLine, root.scrollHeight);
       scrolledTo.current = root.scrollTop;
       restoreRetry.current = null;
     }
@@ -483,7 +512,7 @@ function MarkdownPreview({ path, sync }: { path: string; sync: boolean }) {
   useEffect(() => {
     const root = ref.current;
     if (!root || sync) return;
-    setShownLine(path, previewLineAtOffset(blocksOf(root), root.scrollTop));
+    setShownLine(path, previewLineAtOffset(blocks.current, root.scrollTop));
     return () => setShownLine(path, null);
   }, [sync, path]);
   useEffect(() => () => cancelAnimationFrame(scrollFrame.current), []);
@@ -497,7 +526,7 @@ function MarkdownPreview({ path, sync }: { path: string; sync: boolean }) {
       if (own) return;
       scrolledTo.current = null;
       restoreRetry.current = null;
-      setShownLine(path, previewLineAtOffset(blocksOf(root), root.scrollTop));
+      setShownLine(path, previewLineAtOffset(blocks.current, root.scrollTop));
     });
   };
 
@@ -513,8 +542,15 @@ function MarkdownPreview({ path, sync }: { path: string; sync: boolean }) {
     e.preventDefault();
     const target = resolveLink(path, a.getAttribute("href") ?? "");
     if (!target) return;
-    const scrollTo = (id: string) =>
-      ref.current?.querySelector(`[id="${CSS.escape(ANCHOR_PREFIX + slugify(id))}"]`)?.scrollIntoView();
+    const scrollTo = (id: string) => {
+      const root = ref.current;
+      if (!root) return;
+      const heading = root.querySelector(`[id="${CSS.escape(ANCHOR_PREFIX + slugify(id))}"]`);
+      const footnote = id.startsWith(ANCHOR_PREFIX)
+        ? root.querySelector(`[id="${CSS.escape(id)}"]:is([role="doc-footnote"], [role="doc-noteref"])`)
+        : null;
+      (footnote ?? heading)?.scrollIntoView();
+    };
     if (target.kind === "external") openExternal(target.url);
     else if (target.kind === "anchor") scrollTo(target.id);
     else if (target.path === path && target.anchor) scrollTo(target.anchor);
