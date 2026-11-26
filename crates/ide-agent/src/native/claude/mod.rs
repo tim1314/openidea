@@ -505,7 +505,16 @@ impl Shim {
             "_openidea/context_usage" => {
                 let session = self.session(&params)?;
                 let proc = session.st.lock().proc.clone().ok_or_else(|| internal("Claude Code is not running"))?;
-                rt.block_on(proc.control(json!({ "subtype": "get_context_usage" }))).map_err(internal)
+                let usage = rt.block_on(proc.control(json!({ "subtype": "get_context_usage" }))).map_err(internal)?;
+                // The meter shows the same numbers as these details from now on.
+                let n = |k: &str| usage.get(k).and_then(Value::as_u64);
+                if let (Some(used), Some(size)) = (n("totalTokens"), n("maxTokens").filter(|m| *m > 0)) {
+                    let update = session.st.lock().tr.on_context_usage(used, size);
+                    if let Some(shim) = session.shim() {
+                        shim.notify(vec![update]);
+                    }
+                }
+                Ok(usage)
             }
             "_openidea/stop_task" => {
                 let session = self.session(&params)?;
@@ -1007,11 +1016,16 @@ impl Session {
         let mut updates = Vec::new();
         let mut finished = None;
         let mut read_title = false;
+        let mut refresh_usage = false;
         {
             let mut st = self.st.lock();
             let st = &mut *st;
             match kind {
                 "system" => match msg.get("subtype").and_then(Value::as_str) {
+                    Some("compact_boundary") => {
+                        refresh_usage = msg.pointer("/compact_metadata/post_tokens").is_none_or(Value::is_null);
+                        updates.extend(st.tr.on_message(&msg));
+                    }
                     Some("init") => {
                         st.terminal_only = strings(msg.get("terminal_slash_commands"));
                     }
@@ -1115,6 +1129,31 @@ impl Session {
         if read_title {
             self.read_title();
         }
+        if refresh_usage {
+            self.refresh_usage();
+        }
+    }
+
+    /// Sends what the context holds after a compaction that didn't report it, as Claude Code
+    /// counts it (`get_context_usage`); until then the meter would show the count from before.
+    fn refresh_usage(self: &Arc<Self>) {
+        let me = self.clone();
+        tokio::spawn(async move {
+            let Some(proc) = me.st.lock().proc.clone() else { return };
+            let usage = match proc.control(json!({ "subtype": "get_context_usage" })).await {
+                Ok(usage) => usage,
+                Err(e) => {
+                    tracing::debug!("reading claude context usage after compaction: {e}");
+                    return;
+                }
+            };
+            let n = |k: &str| usage.get(k).and_then(Value::as_u64);
+            let (Some(used), Some(size)) = (n("totalTokens"), n("maxTokens").filter(|m| *m > 0)) else { return };
+            let update = me.st.lock().tr.on_context_usage(used, size);
+            if let Some(shim) = me.shim() {
+                shim.notify(vec![update]);
+            }
+        });
     }
 
     /// Sends the session's title once it has one: the one in its transcript, or else one

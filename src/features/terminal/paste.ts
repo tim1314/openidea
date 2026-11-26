@@ -1,4 +1,5 @@
 import { pasteClipboardFiles, readClipboardPlainText, readClipboardText } from "@/platform/clipboard";
+import { toBase64 } from "@/platform/base64";
 import { call, commands, type TerminalId } from "@/platform/ipc";
 import { tx } from "@/platform/i18n";
 import { usePlatform } from "@/platform/platformInfo";
@@ -67,7 +68,7 @@ function filePaths(transfer: DataTransfer): string[] {
 async function pasteMedia(media: Blob, target: TerminalPasteTarget, paste: (text: string) => void) {
   try {
     if (media.size > MAX_MEDIA_BYTES) throw new Error(tx`Clipboard media is too large to paste (limit ${20} MB).`);
-    const data = Array.from(new Uint8Array(await media.arrayBuffer()));
+    const data = toBase64(new Uint8Array(await media.arrayBuffer()));
     if (!target.current()) return;
     if (!target.supported) throw new Error(tx("Remote server does not support image paste."));
     const path = await call(commands.termStoreImage(target.id, data, media.type));
@@ -163,7 +164,9 @@ export async function pasteTerminalClipboard(paste: (text: string) => void, getT
       for (const item of result.items) {
         const mime = item.types.find(isMedia);
         if (mime) {
+          // oxlint-disable-next-line no-await-in-loop -- the first clipboard item with a supported image type wins
           const image = await item.getType(mime);
+          // oxlint-disable-next-line no-await-in-loop -- this one image is pasted, then the loop stops; later items are not read
           if (target.current()) await pasteMedia(image, target, paste);
           return;
         }

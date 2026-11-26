@@ -13,6 +13,7 @@ import {
   editorService,
   maybeEditorService,
   notifications,
+  projectViewContextLead,
   projectViewSelection,
   toolWindowService,
   type WorktreeReview,
@@ -71,6 +72,7 @@ import {
   type DiffData,
 } from "./diffInput";
 import { buildChangeTree, changeFileNodes, changeGroupPaths, selectedChangeNodes, type ChangeNode } from "./changes";
+import { currentChangeModules } from "./changeModules";
 import { useChangelists } from "./changelists";
 import { openDialog } from "./dialogs";
 import {
@@ -189,6 +191,9 @@ export function currentChangeTree(): ChangeNode[] {
     undefined,
     commit.groupByRepo,
     commit.showUnversionedSeparately,
+    [],
+    currentChangeModules(),
+    commit.groupByModule,
   );
 }
 
@@ -282,9 +287,9 @@ function selectedPaths(arg: unknown): string[] {
   return project.length ? project : contextPaths(arg);
 }
 
-/** Paths a file action targets: the Project view's selection while it has focus, else the open file. */
+/** Uses the Project view's selection while the tree has focus or owns the context. */
 function focusedPaths(arg: unknown, ctx: { projectViewFocus?: unknown }): string[] {
-  return ctx.projectViewFocus ? selectedPaths(arg) : contextPaths(arg);
+  return ctx.projectViewFocus || projectViewContextLead() ? selectedPaths(arg) : contextPaths(arg);
 }
 
 /**
@@ -332,6 +337,7 @@ const OPERATIONS: MenuItem[] = [
   { kind: "action", action: "vcs.compareWithBranch" },
   { kind: "separator" },
   { kind: "action", action: "vcs.branches" },
+  { kind: "action", action: "vcs.copyBranchName" },
   { kind: "action", action: "vcs.push" },
   { kind: "action", action: "vcs.stash" },
   { kind: "action", action: "vcs.unstash" },
@@ -798,6 +804,7 @@ export function registerVcsActions(): () => void {
         }
         for (const target of targets.slice(0, 5)) {
           const data = typeof target === "string" ? groupDiffData(tree, target) : changeNodeDiffData(tree, target);
+          // oxlint-disable-next-line no-await-in-loop -- diff tabs open in selection order
           await openVcsDiff({ ...data, line }, { preview: targets.length === 1 });
         }
       },
